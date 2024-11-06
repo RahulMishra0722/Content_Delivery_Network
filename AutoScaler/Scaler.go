@@ -94,7 +94,8 @@ func (as *Autoscaler) EnsureRedisAndNetwork() error {
 	}
 	return nil
 }
-func (as *Autoscaler) Scaleup(index uint) container.CreateResponse {
+func (as *Autoscaler) Scaleup(port uint) container.CreateResponse {
+
 	ctx, cancel := context.WithTimeout(as.Ctx, 30*time.Second)
 	defer cancel()
 	if err := as.EnsureRedisAndNetwork(); err != nil {
@@ -115,7 +116,7 @@ func (as *Autoscaler) Scaleup(index uint) container.CreateResponse {
 		EndpointsConfig: map[string]*network.EndpointSettings{
 			"app-network": {
 				NetworkID: "app-network",
-				Aliases:   []string{fmt.Sprintf("seeder-809%d", index)},
+				Aliases:   []string{fmt.Sprintf("seeder-%d", port)},
 			},
 		},
 	}
@@ -124,18 +125,18 @@ func (as *Autoscaler) Scaleup(index uint) container.CreateResponse {
 		Env: []string{
 			"REDIS_HOST=redis-server",
 			"REDIS_PORT=6379",
-			fmt.Sprintf("HTTP_PORT=809%d", index),
+			fmt.Sprintf("HTTP_PORT=%d", port),
 		},
 		ExposedPorts: nat.PortSet{
-			nat.Port(fmt.Sprintf("809%d/tcp", index)): struct{}{},
+			nat.Port(fmt.Sprintf("%d/tcp", port)): struct{}{},
 		},
 		Labels: map[string]string{
 			"app.type":   "scalable-service",
-			"app.port":   fmt.Sprintf("809%d", index),
+			"app.port":   fmt.Sprintf("%d", port),
 			"created.at": time.Now().Format(time.RFC3339),
 		},
 		Healthcheck: &container.HealthConfig{
-			Test:     []string{"CMD", "wget", "--spider", "-q", fmt.Sprintf("http://localhost:809%d/health", index)},
+			Test:     []string{"CMD", "wget", "--spider", "-q", fmt.Sprintf("http://localhost:%d/health", port)},
 			Interval: time.Duration(30) * time.Second,
 			Timeout:  time.Duration(10) * time.Second,
 			Retries:  3,
@@ -143,10 +144,10 @@ func (as *Autoscaler) Scaleup(index uint) container.CreateResponse {
 	}
 	hostConfig := &container.HostConfig{
 		PortBindings: nat.PortMap{
-			nat.Port(fmt.Sprintf("809%d/tcp", index)): []nat.PortBinding{
+			nat.Port(fmt.Sprintf("%d/tcp", port)): []nat.PortBinding{
 				{
 					HostIP:   "0.0.0.0",
-					HostPort: fmt.Sprintf("809%d", index),
+					HostPort: fmt.Sprintf("%d", port),
 				},
 			},
 		},
@@ -166,14 +167,14 @@ func (as *Autoscaler) Scaleup(index uint) container.CreateResponse {
 	var resp container.CreateResponse
 	maxRetries := 3
 	for attempt := 1; attempt < maxRetries; attempt++ {
-		log.Printf("Creating container on port %s (attempt %d/%d)...", fmt.Sprintf("809%d", index), attempt, maxRetries)
+		log.Printf("Creating container on port %s (attempt %d/%d)...", fmt.Sprintf("%d", port), attempt, maxRetries)
 		createResp, err := as.DCli.ContainerCreate(
 			ctx,
 			containerConfig,
 			hostConfig,
 			networkConfig,
 			nil,
-			fmt.Sprintf("seeder-%s", fmt.Sprintf("809%d", index)),
+			fmt.Sprintf("seeder-%s", fmt.Sprintf("%d", port)),
 		)
 		if err != nil {
 			if attempt == maxRetries {
@@ -193,13 +194,14 @@ func (as *Autoscaler) Scaleup(index uint) container.CreateResponse {
 			if attempt == maxStartRetries {
 				log.Fatalf("Final attempt %d failed %v. Retrying....", attempt, err)
 			}
+			fmt.Printf("Error Starting Container Err: %v\n", err)
 			time.Sleep(time.Duration(attempt) * time.Second)
 			continue
 		}
 		break
 	}
 	as.ActiveConatiners = append(as.ActiveConatiners, resp.ID)
-	log.Printf("Container started successfully on port %s with ID %s", fmt.Sprintf("809%d", index), resp.ID)
+	log.Printf("Container started successfully on port %s with ID %s", fmt.Sprintf("%d", port), resp.ID)
 	return resp
 }
 
@@ -262,10 +264,37 @@ func (as *Autoscaler) ScaleDown(conatinerId string) error {
 	}
 	return err
 }
+func (as *Autoscaler) ShutDownAllActiveConatiners() error {
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(as.ActiveConatiners))
 
-func (as *Autoscaler) ShutDownAllActiveConatiners() bool {
-	for _, cId := range as.ActiveConatiners {
-		as.ScaleDown(cId)
+	as.Mu.Lock()
+	activeContainers := make([]string, len(as.ActiveConatiners))
+	copy(activeContainers, as.ActiveConatiners)
+	as.Mu.Unlock()
+
+	for _, cId := range activeContainers {
+		wg.Add(1)
+		go func(containerID string) {
+			defer wg.Done()
+
+			if err := as.ScaleDown(containerID); err != nil {
+				errChan <- fmt.Errorf("failed to scale down container %s: %v", containerID, err)
+			}
+		}(cId)
 	}
-	return true
+
+	wg.Wait()
+	close(errChan)
+
+	var errors []error
+	for err := range errChan {
+		errors = append(errors, err)
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("failed to shut down all containers: %v", errors)
+	}
+
+	return nil
 }
